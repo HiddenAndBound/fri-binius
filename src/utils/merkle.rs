@@ -24,12 +24,12 @@ pub struct MerkleTree {
 
 //Struct for Merkle Tree. Backing type chosen to be a hashmap for average case constant insertions and indexing.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Commitment {
-    root: Hash,
-    depth: usize,
+pub struct VectorCommitment {
+    pub root: Hash,
+    pub depth: usize,
 }
 
-impl Commitment {
+impl VectorCommitment {
     pub fn root(&self) -> Hash {
         self.root.clone()
     }
@@ -56,6 +56,14 @@ pub fn hash(data: &[u8]) -> Hash {
 //We assume that the highest level tower field is T_7, so we convert any towerfield element to T_7
 pub fn hash_field<F>(data: &F) -> Hash where BinaryField128b: ExtensionField<F>, F: Field {
     Hash(Keccak256::digest(BinaryField128b::from(*data).val().to_le_bytes()))
+}
+
+pub fn hash_tuple(data: &(BinaryField128b, BinaryField128b)) -> Hash
+{
+    let mut hasher = Keccak256::new();
+    hasher.update(data.0.val().to_le_bytes());
+    hasher.update(data.1.val().to_le_bytes());
+    Hash(hasher.finalize())
 }
 #[inline(always)]
 pub fn hash_concatenation(data1: &Hash, data2: &Hash) -> Hash {
@@ -123,7 +131,7 @@ pub fn get_merkle_path(tree: &HashMap<usize, Vec<Hash>>, leaf_index: usize) -> V
 }
 
 pub fn verify_merkle_path(
-    commitment: &Commitment,
+    commitment: &VectorCommitment,
     leaf_hash: Hash,
     leaf_index: usize,
     merkle_path: &Vec<Hash>
@@ -141,4 +149,49 @@ pub fn verify_merkle_path(
     }
 
     assert_eq!(hash, commitment.root);
+}
+
+pub mod tests {
+    use rand::Rng;
+
+    use super::*;
+
+    #[test]
+    fn make_merkle_tree_test() {
+        use rand::thread_rng;
+
+        let leaf_hashes: Vec<Hash> = (0..1 << 8)
+            .into_iter()
+            .map(|_| {
+                let random_elem = BinaryField128b::random(thread_rng());
+                hash_field(&random_elem)
+            })
+            .collect();
+
+        let merkle_tree = merklize(leaf_hashes);
+    }
+
+    #[test]
+    fn get_merkle_path_test() {
+        use rand::thread_rng;
+
+        let leaf_hashes: Vec<Hash> = (0..1 << 8)
+            .into_iter()
+            .map(|_| {
+                let random_elem = BinaryField128b::random(thread_rng());
+                hash_field(&random_elem)
+            })
+            .collect();
+
+        let merkle_tree = merklize(leaf_hashes.clone());
+        let commitment = VectorCommitment {
+            root: merkle_tree.get_root(),
+            depth: 8,
+        };
+
+        let idx = thread_rng().gen_range(0..1 << 8);
+        let merkle_path = merkle_tree.get_merkle_path(idx);
+
+        verify_merkle_path(&commitment, leaf_hashes[idx].clone(), idx, &merkle_path);
+    }
 }

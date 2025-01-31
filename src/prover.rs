@@ -1,320 +1,313 @@
-use std::{cell::UnsafeCell, cmp::max, thread::{self, available_parallelism}};
+use std::{ cell::UnsafeCell, cmp::max, thread::{ self, available_parallelism } };
 
-use binius_field::BinaryField128b;
+use binius_field::{
+    arithmetic_traits::Square, BinaryField, BinaryField128b, BinaryField1b, ExtensionField, Field, TowerField
+};
+use binius_ntt::MultithreadedNTT;
+use rayon::{ iter::{ IntoParallelIterator, ParallelIterator }, slice::ParallelSlice };
+use sha3::{ Digest, Keccak256 };
 use tracing::instrument;
 
-#[instrument(skip_all, name = "commit_oracle", level = "debug")]
-pub fn commit_oracle(code: &Code<BinaryField128b>) -> (VectorCommitment, MerkleTree) {
-    let mut leaf_hashes: Vec<Hash> = vec![hash(&code.0[0].0.to_le_bytes()); code.0.len()];
-    
-    code
-        .0
-        .par_iter()
-        .map(|val| hash(&val.0.to_le_bytes()))
-        .collect_into_vec(&mut leaf_hashes);
+use crate::utils::{
+    channel::{ self, Channel },
+    code::{ Code, LOG_RATE, RATE },
+    merkle::{ merklize, Hash, MerkleTree, VectorCommitment },
+    mle::{ compute_dot_product, LagrangeBases, PackedMLE },
+    TAU,
+};
 
-    let merkle_tree = merklize(leaf_hashes);
-
-    let merkle_root = merkle_tree.get_root();
-
-    (
-        VectorCommitment::new(merkle_root, code.0.len()),
-        merkle_tree,
-    )
+pub struct FriCommitment {
+    pub vector_commitment: VectorCommitment,
+    pub packing_factor: usize,
 }
 
-#[instrument(skip_all, name = "commit", level = "debug")]
-pub fn commit(mle: &MLE<BinaryField64b>) -> (Commitment, MerkleTree, Code<BinaryField64b>) {
-    let encoding = encode(&mle.poly);
-
-    let mut leaf_hashes: Vec<Hash> = vec![hash_128(&(encoding[0].into())); encoding.len()];
-    
-    encoding
-        .par_iter()
-        .copied()
-        .map(|val| hash_128(&(val.into())))
-        .collect_into_vec(&mut leaf_hashes);
-
-
-    let merkle_tree = merklize(leaf_hashes);
-
-    let merkle_root = merkle_tree.get_root();
-
-    (
-        Commitment::new(merkle_root, mle.variables, mle.packing_factor),
-        merkle_tree,
-        Code(encoding),
-    )
-}
-
-
-
-
-#[instrument(skip_all, level = "debug")]
-pub fn eval_proof<F>(
-    mle: &MLE<F>,
-    point: &Vec<BinaryField128b>,
-    encoding: &Code<F>,
-    merkle_tree: &MerkleTree,
-    channel: &mut Channel,
-) -> EvalProof 
-where F:BinaryField
-+ TowerField
-+ Mul<BinaryField128b, Output = BinaryField128b>
-+ Add<BinaryField128b, Output = BinaryField128b>
-+ Copy
-+ Mul<BinaryField32b, Output = F>
-+ AddAssign<<F as Mul<BinaryField32b>>::Output>,
-BinaryField128b: ExtensionField<F>
+pub fn commit<F>(
+    mle: &PackedMLE<F>,
+    ntt: &MultithreadedNTT<BinaryField128b>
+)
+    -> (FriCommitment, Code<BinaryField128b>, MerkleTree)
+    where F: BinaryField + TowerField, BinaryField128b: ExtensionField<F>
 {
-    let rounds = mle.variables - mle.packing_factor;
-    let norms = compute_norms(rounds);
-    let mut current_encoding = Code(Vec::new());
-    let mut current_merkle_tree = merkle_tree.clone();
+    let code = Code::new(&mle.coeffs, ntt);
 
-    let mut folded_handle = MLE::new(
-        mle.poly
-            .par_iter()
-            .map(|coeff| BinaryField128b::from(*coeff))
-            .collect(),
-        true,
-    );
+    let leaf_hashes: Vec<Hash> = code.encoding
+        .par_chunks(2)
+        .map(|pair| {
+            let mut hasher = Keccak256::new();
+            hasher.update(pair[0].val().to_le_bytes());
+            hasher.update(pair[1].val().to_le_bytes());
 
-    let mut oracle_commitments = Vec::new();
-    let mut oracle_merkle_trees = Vec::new();
-    let mut oracles = Vec::new();
+            Hash(hasher.finalize())
+        })
+        .collect();
 
-    let threads = match available_parallelism() {
-        Ok(n_threads) => n_threads.get(),
-        Err(err) => panic!("{:?}", err),
+    let merkle_tree = merklize(leaf_hashes);
+
+    let vector_commitment = VectorCommitment {
+        root: merkle_tree.get_root(),
+        depth: (code.encoding.len().trailing_zeros() - 1) as usize,
     };
 
-    let mut round_merkle_paths = Vec::new();
-    let mut round_queried_locations = Vec::new();
-    let mut polys: Vec<Vec<PackedAlgebra128>> = Vec::new();
+    let fri_commitment = FriCommitment {
+        vector_commitment,
+        packing_factor: F::LOG_DEGREE,
+    };
 
-    let mut eq = LagrangeBases::gen_from_point(&point[mle.packing_factor..].to_vec());
+    (fri_commitment, code, merkle_tree)
+}
 
-    let fold = mle.fold_as_unpacked_hi(&eq);
+pub fn commit_oracle(code: &Code<BinaryField128b>) -> (VectorCommitment, MerkleTree) {
+    let leaf_hashes: Vec<Hash> = code.encoding
+        .par_chunks(2)
+        .map(|pair| {
+            let mut hasher = Keccak256::new();
+            hasher.update(BinaryField128b::from(pair[0]).val().to_le_bytes());
+            hasher.update(BinaryField128b::from(pair[1]).val().to_le_bytes());
 
-    let mut evals = [BinaryField128b::ZERO; 128];
+            Hash(hasher.finalize())
+        })
+        .collect();
 
-    for i in 0..F::N_BITS {
-        evals[i] = fold.idx(i)
-    }
+    let merkle_tree = merklize(leaf_hashes);
 
-    let mut current_sum = PackedAlgebra128::new(evals);
+    let vector_commitment = VectorCommitment {
+        root: merkle_tree.get_root(),
+        depth: (code.encoding.len().trailing_zeros() - 1) as usize,
+    };
 
-    eq.fold_in();
+    (vector_commitment, merkle_tree)
+}
 
-    //Tensor sum check
+///We assume that each coefficient of mle actually represents a packed vector of F_2 elements equal to number of bits required to represent F or
+///F's dimension as a vector space over F_2
+pub fn prove<F>(
+    mle: &PackedMLE<F>,
+    eval_point: &[BinaryField128b],
+    eval: BinaryField128b,
+    encoding: &Code<BinaryField128b>,
+    commitment: &FriCommitment,
+    merkle_tree: &MerkleTree,
+    ntt: &MultithreadedNTT<BinaryField128b>,
+    channel: &mut Channel
+)
+    -> EvalProof
+    where F: BinaryField + TowerField, BinaryField128b: ExtensionField<F>
+{
+    //The statement should be observed
+    channel.observe_fri_commitment(commitment);
+    channel.observe_field_elems(eval_point).expect("failed to observe eval_point");
+    channel.observe_field_elem(eval).expect("failed to observe eval");
+
+    let (left, right) = eval_point.split_at(TAU);
+
+    let (mut left_eq, mut right_eq) = (
+        LagrangeBases::gen_from_point(left),
+        LagrangeBases::gen_from_point(right),
+    );
+
+    let upper_partial_evals = get_partial_evals(mle, &right_eq);
+
+    let tensor_batching_point = channel
+        .get_random_points(TAU)
+        .expect("unable to sample random point for tensor batching");
+
+    let batching_eq = LagrangeBases::gen_from_point(&tensor_batching_point);
+
+    let mut repacked_mle = mle.clone().repack_for_fri();
+
+    let mut sum_check_claim = compute_dot_product(&upper_partial_evals, &batching_eq.vals);
+
+    let right_eq_mle = PackedMLE::<BinaryField128b>::new(right_eq.vals, true);
+    let mut tensored_eq = LagrangeBases::from_mle(right_eq_mle.fold_as_unpacked_lo(&batching_eq));
+    let rounds = right.len();
+
+    let mut sum_check_oracles = Vec::new();
+
+    let mut fri_folded_codes: Vec<Code<BinaryField128b>> = Vec::new();
+    let mut fri_oracles: Vec<VectorCommitment> = Vec::new();
+    let mut fri_merkle_trees: Vec<MerkleTree> = Vec::new();
+
+    let eval:BinaryField128b = (0..repacked_mle.len()).into_par_iter().map(|i| (repacked_mle.idx(i) * tensored_eq.idx(i))).sum();
+
     for round in 0..rounds {
+        //Sum check Logic
+        let half_size = 1 << (rounds - round - 1);
 
-        let halfsize = 1 << (rounds - round - 1);
+        let mut eval_at_0 = (0..half_size).into_par_iter().map(|i| (repacked_mle.idx(i << 1) * tensored_eq.idx(i<<1))).sum();
+    
+        let eval_at_1 =
+            sum_check_claim + eval_at_0;
 
-        let chunk_size = max(halfsize / threads, 1);
-        let chunks = halfsize / chunk_size;
-        let handle_cell = UnsafeCell::new(&folded_handle);
-        let eq_cell = UnsafeCell::new(&eq);
-        let current_round_point = &point[mle.packing_factor + round];
-
-        let mut eval_acc = tensor_sum_check_round(round, rounds, &mle, &folded_handle, &eq);
-
-        let eval_0 = PackedAlgebra128(eval_acc);
-        let eval_1 = (current_sum
-            - eval_0.scalar_mul(&(BinaryField128b::ONE + current_round_point)))
-        .scalar_mul(&current_round_point.invert().unwrap());
-
-        let coeffs = vec![eval_0, eval_1];
-
-        channel.reseed(&PackedAlgebra128::unpack(coeffs.clone()));
-
-        let r = channel.get_random_point();
+        let eval_at_inf = (0..half_size).into_par_iter().map(|i| (repacked_mle.idx(i << 1) + repacked_mle.idx((i << 1)|1))  * (tensored_eq.idx(i<<1) + tensored_eq.idx((i<<1) | 1))).sum();
         
-        let fold_coeffs = MLE::<BinaryField128b>::fold(&folded_handle, &r);
-        folded_handle = MLE::new(fold_coeffs.poly, true);
+        let poly = Univariate::new([eval_at_0, eval_at_0 + eval_at_1 + eval_at_inf, eval_at_inf]);
 
-        if round == 0 && round + 7 <= rounds{
-            current_encoding = fold_code(r, round, &encoding, &norms);
+        channel
+            .observe_field_elems(&poly.coeffs)
+            .expect(&format!("failed to observe prover oracle in sum check: round {round}"));
 
-            let (current_commitment, current_merkle_tree) = commit_oracle(&current_encoding);
+        let r = channel
+            .get_random_point()
+            .expect(&format!("failed to get verifier challenge in sumcheck: round {round}"));
 
-            oracles.push(current_encoding.clone());
-            oracle_commitments.push(current_commitment);
-            oracle_merkle_trees.push(current_merkle_tree);
-        } else if round > 0 && round + 7 <= rounds{
-            current_encoding = fold_code::<BinaryField128b>(r, round, &current_encoding, &norms);
-            let (current_commitment, current_merkle_tree) = commit_oracle(&current_encoding);
+        sum_check_claim = poly.evaluate(r);
 
-            oracles.push(current_encoding.clone());
-            oracle_commitments.push(current_commitment);
-            oracle_merkle_trees.push(current_merkle_tree);
-        }
+        //Folding the code with the sum check challenges.
+        let folded_code: Code<BinaryField128b> = match round {
+            0 => encoding.fold_code(r, round, ntt),
+            _ => fri_folded_codes[round - 1].fold_code(r, round, ntt),
+        };
 
-        eq.fold_in();
+        let (commitment, merkle_tree) = commit_oracle(&folded_code);
 
-        current_sum = coeffs[0] + (coeffs[0] + coeffs[1]) * r;
+        channel.observe_vector_commitment(&commitment);
 
-        polys.push(coeffs);
+        fri_folded_codes.push(folded_code);
+        fri_oracles.push(commitment);
+        fri_merkle_trees.push(merkle_tree);
+        sum_check_oracles.push(poly);
+        repacked_mle = repacked_mle.fold_lo(&r);
+        tensored_eq.fold_lo(&r);
     }
 
+    //FRI
+    let final_code_folded_value = fri_folded_codes[rounds - 1].idx(0);
+    let c: BinaryField128b = <BinaryField128b as ExtensionField<BinaryField1b>>
+        ::iter_bases(&final_code_folded_value)
+        .zip(batching_eq.vals)
+        .map(|(component, coeff)| component * coeff)
+        .sum();
 
-    let mut current_queries: Vec<usize> = gen_queries(mle.len() * RATE, channel)
+    channel
+        .observe_field_elem(final_code_folded_value)
+        .expect("Failed to observe final sum check claim");
+
+    let mut current_queries: Vec<usize> = channel
+        .gen_queries(right.len() + LOG_RATE)
+        .expect("Failed to generate FRI queries.")
         .iter()
         .map(|i| i >> 1)
         .collect();
 
-    //FRI
+    let mut round_merkle_paths: Vec<Vec<Vec<Hash>>> = Vec::new();
+    let mut round_queried_symbols: Vec<Vec<(BinaryField128b, BinaryField128b)>> = Vec::new();
     for round in 0..rounds {
-        if round == 0 && round + 7 <= rounds {
-            let merkle_paths: Vec<(Vec<Hash>, Vec<Hash>)> = current_queries
-                .iter()
-                .map(|i| {
-                    (
-                        merkle_tree.get_merkle_path(*i << 1),
-                        merkle_tree.get_merkle_path((*i << 1) | 1),
-                    )
-                })
-                .collect();
+        let (merkle_paths, queried_symbols) = match round {
+            0 => {
+                (
+                    current_queries
+                        .iter()
+                        .map(|i| { merkle_tree.get_merkle_path(*i) })
+                        .collect(),
+                    current_queries
+                        .iter()
+                        .map(|i| {
+                            (
+                                encoding.encoding[i << 1],
+                                encoding.encoding[(i << 1) | 1],
+                            )
+                        })
+                        .collect(),
+                )
+            }
+            _ => {
+                (
+                    current_queries
+                        .iter()
+                        .map(|i| { fri_merkle_trees[round - 1].get_merkle_path(*i) })
+                        .collect(),
 
-            let queried_locations: Vec<(BinaryField128b, BinaryField128b)> = current_queries
-                .iter()
-                .map(|i| (encoding.0[*i << 1].into(), encoding.0[(*i << 1) | 1].into()))
-                .collect();
+                    current_queries
+                        .iter()
+                        .map(|i| {
+                            (
+                                fri_folded_codes[round - 1].encoding[i << 1],
+                                fri_folded_codes[round - 1].encoding[(i << 1) | 1],
+                            )
+                        })
+                        .collect(),
+                )
+            }
+        };
+        round_merkle_paths.push(merkle_paths);
+        round_queried_symbols.push(queried_symbols);
 
-            round_merkle_paths.push(merkle_paths);
-            round_queried_locations.push(queried_locations);
-        } else if round > 0 && round + 7 <= rounds {
-            let merkle_paths: Vec<(Vec<Hash>, Vec<Hash>)> = current_queries
-                .iter()
-                .map(|i| {
-                    (
-                        oracle_merkle_trees[round - 1].get_merkle_path(*i << 1),
-                        oracle_merkle_trees[round - 1].get_merkle_path((*i << 1) | 1),
-                    )
-                })
-                .collect();
-            let queried_locations: Vec<(BinaryField128b, BinaryField128b)> = current_queries
-                .iter()
-                .map(|i| {
-                    (
-                        oracles[round - 1].0[*i << 1].into(),
-                        oracles[round - 1].0[(*i << 1) | 1].into(),
-                    )
-                })
-                .collect();
-
-            round_merkle_paths.push(merkle_paths);
-            round_queried_locations.push(queried_locations);
-        }
-
-        current_queries = current_queries.iter().map(|i| i >> 1).collect();
-    }
-
-    println!("code length {:?}", current_encoding.0.len());
-    println!("rounds: {rounds}");
-    if rounds < 7{
-        current_encoding = Code(encoding.0.par_iter().copied().map(|val| BinaryField128b::from(val)).collect());
+        current_queries.iter_mut().for_each(|i| {
+            *i >>= 1;
+        });
     }
 
     EvalProof::new(
-        fold.poly,
-        polys,
-        oracle_commitments,
-        PackedAlgebra128::from(&folded_handle.idx(0)),
-        round_queried_locations,
-        round_merkle_paths,
-        current_encoding
+        upper_partial_evals,
+        sum_check_oracles,
+        fri_oracles,
+        final_code_folded_value,
+        round_queried_symbols,
+        round_merkle_paths
     )
 }
 
-#[instrument(skip_all, name = "tensor_sum_check_round", level = "debug")]
-pub fn tensor_sum_check_round<F>(round: usize, rounds:usize, handle: &MLE<F>, folded_handle: &MLE<BinaryField128b>, eq: &LagrangeBases) -> [BinaryField128b; 128]
-where F:BinaryField
-+ TowerField
-+ Mul<BinaryField128b, Output = BinaryField128b>
-+ Add<BinaryField128b, Output = BinaryField128b>
-+ Copy
-+ Mul<BinaryField32b, Output = F>
-+ AddAssign<<F as Mul<BinaryField32b>>::Output>,
-BinaryField128b: ExtensionField<F>{
-    let halfsize = 1 << (rounds - round - 1);
+pub struct EvalProof {
+    pub upper_partial_evals: Vec<BinaryField128b>,
+    pub sum_check_oracles: Vec<Univariate>,
+    pub final_folded_value: BinaryField128b,
+    pub fri_oracles: Vec<VectorCommitment>,
+    pub fri_queried_symbols: Vec<Vec<(BinaryField128b, BinaryField128b)>>,
+    pub fri_merkle_paths: Vec<Vec<Vec<Hash>>>,
+}
 
-        let threads = match available_parallelism() {
-            Ok(n_threads) => n_threads.get(),
-            Err(err) => panic!("{:?}", err),
-        };
-        let chunk_size = max((halfsize + 1) / threads, 1);
-        let chunks = halfsize/ chunk_size;
-        let handle_cell = UnsafeCell::new(&folded_handle);
-        let eq_cell = UnsafeCell::new(&eq);
-        let mut eval_acc = [BinaryField128b::ZERO; 128];
-
-        if round == 0 {
-            thread::scope(|scope| {
-                let mut thread_results = Vec::new();
-                
-            
-                for chunk in 0..chunks {
-                 
-                    let handle = unsafe{& *handle_cell.get()};
-
-                    let eq_ref = unsafe{& *eq_cell.get()};
-
-                    
-                    thread_results.push(scope.spawn(move || {
-                        let mut acc = [BinaryField128b::ZERO; 128];
-                        for i in chunk * chunk_size..(chunk + 1) * chunk_size {
-                            for b in 0..F::N_BITS {
-                                acc[b] += handle.packed_idx((i << 8) | b) * eq_ref.idx(i)
-                            }
-                        }
-                        acc
-                    }))
-                }
-
-                for res in thread_results {
-                    match res.join() {
-                        Ok(result) => {
-                            for i in 0..F::N_BITS {
-                                eval_acc[i] += result[i]
-                            }
-                        }
-                        Err(error) => panic!("{:?}", error),
-                    }
-                }
-            });
-        } else {
-            thread::scope(|scope| {
-                let mut thread_results = Vec::new();
-
-                for chunk in 0..chunks {
-                    let handle = unsafe{& *handle_cell.get()};
-
-                    let eq_ref = unsafe{& *eq_cell.get()};
-                    thread_results.push(scope.spawn(move || {
-                        let mut acc = [BinaryField128b::ZERO; 128];
-
-                        for i in chunk * chunk_size..(chunk + 1) * chunk_size {
-                            for b in 0..128 {
-                                acc[b] += handle.packed_idx((i << 8) | b) * eq_ref.idx(i)
-                            }
-                        }
-                        acc
-                    }))
-                }
-
-                for res in thread_results {
-                    match res.join() {
-                        Ok(result) => {
-                            for i in 0..128 {
-                                eval_acc[i] += result[i]
-                            }
-                        }
-                        Err(error) => panic!("{:?}", error),
-                    }
-                }
-            });
+impl EvalProof {
+    pub fn new(
+        upper_partial_evals: Vec<BinaryField128b>,
+        sum_check_oracles: Vec<Univariate>,
+        fri_oracles: Vec<VectorCommitment>,
+        final_folded_value: BinaryField128b,
+        fri_queried_symbols: Vec<Vec<(BinaryField128b, BinaryField128b)>>,
+        fri_merkle_paths: Vec<Vec<Vec<Hash>>>
+    ) -> EvalProof {
+        EvalProof {
+            upper_partial_evals,
+            sum_check_oracles,
+            fri_oracles,
+            final_folded_value,
+            fri_queried_symbols,
+            fri_merkle_paths,
         }
-        eval_acc
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Univariate {
+    pub coeffs: [BinaryField128b; 3],
+}
+
+impl Univariate {
+    pub fn new(coeffs: [BinaryField128b; 3]) -> Univariate {
+        Univariate {
+            coeffs,
+        }
+    }
+
+    pub fn evaluate(&self, r: BinaryField128b) -> BinaryField128b {
+        self.coeffs[0] + self.coeffs[1] * r + self.coeffs[2] * r.square()
+    }
+}
+
+pub fn get_partial_evals<F>(
+    mle: &PackedMLE<F>,
+    eq: &LagrangeBases
+)->Vec<BinaryField128b>
+where 
+F:BinaryField+TowerField,
+BinaryField128b:ExtensionField<F>
+{
+    (0..1 << TAU).into_par_iter().map(|k| {
+        let vars = mle.variables;
+
+        let res:BinaryField128b = (0..1<<(vars-TAU)).into_iter().map(move |j|
+            mle.packed_idx(k.clone() | (j<<TAU))*eq.idx(j)
+        ).sum();
+
+        res
+    }).collect()
 }

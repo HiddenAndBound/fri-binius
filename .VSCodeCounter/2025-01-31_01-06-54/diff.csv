@@ -1,0 +1,8 @@
+"filename", "language", "rs", "comment", "blank", "total"
+"/home/ritwik/fri-binius/src/prover.rs", "rs", 32, 0, 3, 35
+"/home/ritwik/fri-binius/src/utils/channel.rs", "rs", 5, 0, 1, 6
+"/home/ritwik/fri-binius/src/utils/code.rs", "rs", 15, -1, 9, 23
+"/home/ritwik/fri-binius/src/utils/merkle.rs", "rs", -1, 0, 0, -1
+"/home/ritwik/fri-binius/src/utils/mle.rs", "rs", 21, 0, 4, 25
+"/home/ritwik/fri-binius/src/verifier.rs", "rs", 57, 0, 4, 61
+"Total", "-", 129, -1, 21, 149
