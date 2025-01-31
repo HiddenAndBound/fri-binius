@@ -1,0 +1,13 @@
+[package]
+name = "fri-binius"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+binius_field = {git = "https://gitlab.com/IrreducibleOSS/binius" }
+binius_ntt = {git = "https://gitlab.com/IrreducibleOSS/binius" }
+binius_utils = {git = "https://gitlab.com/IrreducibleOSS/binius" }
+rayon = "1.10.0"
+sha3 = "0.10.8"
+tracing = "0.1.38"
+tracing-profile = "0.9.1"
