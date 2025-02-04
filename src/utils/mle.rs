@@ -6,12 +6,15 @@ use binius_field::{
     Field,
     TowerField,
 };
-use rayon::{iter::{
-    IndexedParallelIterator,
-    IntoParallelIterator,
-    IntoParallelRefMutIterator,
-    ParallelIterator,
-}, slice::ParallelSlice};
+use rayon::{
+    iter::{
+        IndexedParallelIterator,
+        IntoParallelIterator,
+        IntoParallelRefMutIterator,
+        ParallelIterator,
+    },
+    slice::ParallelSlice,
+};
 
 use crate::utils::{ mle, TAU };
 
@@ -50,11 +53,13 @@ impl<F> PackedMLE<F> where F: BinaryField + TowerField, BinaryField128b: Extensi
         <F as ExtensionField<BinaryField1b>>::iter_bases(&self.coeffs[out_idx]).nth(in_idx).unwrap()
     }
 
-    pub fn repack_for_fri(self)->PackedMLE<BinaryField128b>{
+    pub fn repack_for_fri(self) -> PackedMLE<BinaryField128b> {
         PackedMLE::<BinaryField128b>::new(
-             self.coeffs.par_chunks(<BinaryField128b as ExtensionField<F>>::DEGREE).map(|base_elems| BinaryField128b::from_bases(base_elems).unwrap()).collect(),
-             false
-        
+            self.coeffs
+                .par_chunks(<BinaryField128b as ExtensionField<F>>::DEGREE)
+                .map(|base_elems| BinaryField128b::from_bases(base_elems).unwrap())
+                .collect(),
+            false
         )
     }
     pub fn get_bound_elem(&self, idx: usize, eq: &LagrangeBases) -> BinaryField128b {
@@ -104,8 +109,10 @@ impl<F> PackedMLE<F> where F: BinaryField + TowerField, BinaryField128b: Extensi
             (0..1 << (self.variables - TAU))
                 .into_par_iter()
                 .map(|k| {
-
-                    let res = (0..1<<TAU).into_iter().map(|i| self.packed_idx(i | (k<<TAU)) * eq.idx(i) ).sum();
+                    let res = (0..1 << TAU)
+                        .into_iter()
+                        .map(|i| self.packed_idx(i | (k << TAU)) * eq.idx(i))
+                        .sum();
                     res
                 })
                 .collect(),
@@ -122,7 +129,7 @@ impl<F> PackedMLE<F> where F: BinaryField + TowerField, BinaryField128b: Extensi
         let half_len = self.coeffs.len() >> 1;
         let fold = (0..half_len)
             .into_par_iter()
-            .map(|i| *r * (self.coeffs[i << 1] + self.coeffs[(i << 1) | 1] + self.coeffs[i << 1]))
+            .map(|i| *r * (self.coeffs[i << 1] + self.coeffs[(i << 1) | 1]) + self.coeffs[i << 1])
             .collect();
 
         PackedMLE::<BinaryField128b>::new(fold, false)
@@ -174,11 +181,11 @@ impl LagrangeBases {
         }
     }
 
-    pub fn from_mle(mle:PackedMLE<BinaryField128b>) -> LagrangeBases {
-        let vars =  mle.coeffs.len().trailing_zeros() as usize;
+    pub fn from_mle(mle: PackedMLE<BinaryField128b>) -> LagrangeBases {
+        let vars = mle.coeffs.len().trailing_zeros() as usize;
         LagrangeBases {
             vals: mle.coeffs,
-            vars
+            vars,
         }
     }
 
@@ -201,22 +208,21 @@ impl LagrangeBases {
         self.vars += 1;
     }
 
-    pub fn fold_lo(&mut self, r: &BinaryField128b){
+    pub fn fold_lo(&mut self, r: &BinaryField128b) {
         let half_len = self.vals.len() >> 1;
-        let fold:Vec<BinaryField128b> = (0..half_len)
+        let fold: Vec<BinaryField128b> = (0..half_len)
             .into_par_iter()
-            .map(|i| *r * (self.vals[i << 1] + self.vals[(i << 1) | 1] + self.vals[i << 1]))
+            .map(|i| *r * (self.vals[i << 1] + self.vals[(i << 1) | 1]) + self.vals[i << 1])
             .collect();
 
         self.vals = fold;
-        self.vars -= 1
-
+        self.vars -= 1;
     }
 
     //Compute eq table with one variable dropped for Gruen's optimisation.
     pub fn fold_in(&mut self) {
-        if self.vars > 0 {
-            let fold = (0..1 << (self.vars - 1))
+        if self.vals.len() > 1 {
+            let fold = (0..self.vals.len()/2)
                 .into_par_iter()
                 .map(|i| self.idx(i << 1) + self.idx((i << 1) | 1))
                 .collect();
@@ -254,11 +260,47 @@ fn compute_eq(r: &[BinaryField128b]) -> Vec<BinaryField128b> {
 }
 
 pub fn compute_dot_product(
-    scalars: &Vec<BinaryField128b>,
-    vals: &Vec<BinaryField128b>
+    scalars: &[BinaryField128b],
+    vals: &[BinaryField128b]
 ) -> BinaryField128b {
     vals.iter()
         .zip(scalars.iter())
         .map(|(val, scalar)| *scalar * *val)
         .sum()
 }
+
+//Assumes input is in column view.
+pub fn compute_row_batch(
+    scalars: &[BinaryField128b],
+    vals: &[BinaryField128b]
+) -> BinaryField128b {
+    let row_view = switch_view(vals);
+
+    row_view.iter()
+        .zip(scalars.iter())
+        .map(|(val, scalar)| *scalar * *val)
+        .sum()
+}
+
+//Switches view of an algebra element from column to row and vice versa.
+pub fn switch_view(
+    vals: &[BinaryField128b],
+) -> Vec<BinaryField128b> {
+    let mut row_view = Vec::new();
+
+    for i in 0..128 {
+        let mut row_bases = Vec::new();
+        for j in 0..128 {
+            row_bases.push(
+                <BinaryField128b as ExtensionField<BinaryField1b>>
+                    ::iter_bases(&vals[j])
+                    .nth(i)
+                    .unwrap()
+            );
+        }
+        row_view.push(BinaryField128b::from_bases(&row_bases).unwrap())
+    }
+
+   row_view
+}
+

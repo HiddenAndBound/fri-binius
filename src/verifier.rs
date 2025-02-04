@@ -7,11 +7,12 @@ use crate::{
         channel::{ self, Channel },
         code::{ fold, LOG_RATE },
         merkle::{ hash_field, hash_tuple, verify_merkle_path, VectorCommitment },
-        mle::LagrangeBases, TAU,
+        mle::{compute_row_batch, switch_view, LagrangeBases}, TAU,
     },
 };
 
-//The generic parameter defines the packing factor.
+
+
 pub fn verify(
     commitment: &FriCommitment,
     eval_point: &[BinaryField128b],
@@ -42,11 +43,8 @@ pub fn verify(
         .expect("unable to sample random point for tensor batching");
 
     let batching_eq = compute_eq_table(&tensor_batching_point);
-    let mut sum_check_claim = BinaryField128b::ZERO;
-
-    for i in 0..1 << TAU {
-        sum_check_claim += batching_eq[i] * eval_proof.upper_partial_evals[i];
-    }
+    let mut sum_check_claim = compute_row_batch(&batching_eq, &eval_proof.upper_partial_evals);
+    
 
     let rounds = right.len();
 
@@ -54,7 +52,7 @@ pub fn verify(
 
     let mut random_point = Vec::new();
     for round in 0..rounds {
-        let oracle = eval_proof.sum_check_oracles[round];
+        let oracle = &eval_proof.sum_check_oracles[round];
 
         assert_eq!(
              oracle.evaluate(BinaryField128b::ZERO) + oracle.evaluate(BinaryField128b::ONE),
@@ -180,4 +178,30 @@ pub fn compute_eq_table(r: &[BinaryField128b]) -> Vec<BinaryField128b> {
         }
     }
     eq
+}
+
+pub fn compute_eq_tower_ind(r_init: &[BinaryField128b], r_sum:&[BinaryField128b], eq_batch:&[BinaryField128b])->BinaryField128b{
+    assert_eq!(r_init.len(), r_sum.len());
+
+    let mut eval = vec![BinaryField128b::ZERO; 128];
+
+    eval[0] = BinaryField128b::ONE;
+
+    for i in 0..r_init.len(){
+        for k in 0..128{
+            let temp = eval[i]*r_init[i];
+            eval[i] += temp
+        }
+        
+        eval = switch_view(&eval);
+
+        for k in 0..128{
+            let temp = eval[i]*r_sum[i];
+            eval[i] += temp
+        }
+
+        eval = switch_view(&eval);
+    }
+
+    compute_row_batch(eq_batch, &eval)
 }

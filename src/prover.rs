@@ -1,20 +1,21 @@
 use std::{ cell::UnsafeCell, cmp::max, thread::{ self, available_parallelism } };
 
 use binius_field::{
-    arithmetic_traits::Square, BinaryField, BinaryField128b, BinaryField1b, ExtensionField, Field, TowerField
+    arithmetic_traits::{Square, TaggedSquare}, BinaryField, BinaryField128b, BinaryField1b, ExtensionField, Field, PackedBinaryField128x1b, PackedField, TowerField
 };
 use binius_ntt::MultithreadedNTT;
+use rand::thread_rng;
 use rayon::{ iter::{ IntoParallelIterator, ParallelIterator }, slice::ParallelSlice };
 use sha3::{ Digest, Keccak256 };
 use tracing::instrument;
 
-use crate::utils::{
+use crate::{utils::{
     channel::{ self, Channel },
     code::{ Code, LOG_RATE, RATE },
     merkle::{ merklize, Hash, MerkleTree, VectorCommitment },
-    mle::{ compute_dot_product, LagrangeBases, PackedMLE },
+    mle::{ compute_dot_product, compute_row_batch, LagrangeBases, PackedMLE },
     TAU,
-};
+}, verifier::compute_eq_tower_ind};
 
 pub struct FriCommitment {
     pub vector_commitment: VectorCommitment,
@@ -115,10 +116,12 @@ pub fn prove<F>(
 
     let mut repacked_mle = mle.clone().repack_for_fri();
 
-    let mut sum_check_claim = compute_dot_product(&upper_partial_evals, &batching_eq.vals);
-
-    let right_eq_mle = PackedMLE::<BinaryField128b>::new(right_eq.vals, true);
+    let mut sum_check_claim = compute_row_batch(&batching_eq.vals, &upper_partial_evals);
+    
+    let right_eq_mle = PackedMLE::<BinaryField128b>::new(right_eq.vals, true);    
+    
     let mut tensored_eq = LagrangeBases::from_mle(right_eq_mle.fold_as_unpacked_lo(&batching_eq));
+
     let rounds = right.len();
 
     let mut sum_check_oracles = Vec::new();
@@ -127,20 +130,22 @@ pub fn prove<F>(
     let mut fri_oracles: Vec<VectorCommitment> = Vec::new();
     let mut fri_merkle_trees: Vec<MerkleTree> = Vec::new();
 
-    let eval:BinaryField128b = (0..repacked_mle.len()).into_par_iter().map(|i| (repacked_mle.idx(i) * tensored_eq.idx(i))).sum();
+    let eval:BinaryField128b = (0..1<<right.len()).into_par_iter().map(|i| (repacked_mle.idx(i) * tensored_eq.idx(i))).sum();
 
+    println!("{:?}",eval);
+    let mut random_challenges = Vec::new();
     for round in 0..rounds {
         //Sum check Logic
         let half_size = 1 << (rounds - round - 1);
 
-        let mut eval_at_0 = (0..half_size).into_par_iter().map(|i| (repacked_mle.idx(i << 1) * tensored_eq.idx(i<<1))).sum();
-    
-        let eval_at_1 =
-            sum_check_claim + eval_at_0;
-
-        let eval_at_inf = (0..half_size).into_par_iter().map(|i| (repacked_mle.idx(i << 1) + repacked_mle.idx((i << 1)|1))  * (tensored_eq.idx(i<<1) + tensored_eq.idx((i<<1) | 1))).sum();
+        let eval_at_0 = (0..half_size).into_par_iter().map(|i| (repacked_mle.idx(i << 1) * tensored_eq.idx(i<<1))).sum();
         
-        let poly = Univariate::new([eval_at_0, eval_at_0 + eval_at_1 + eval_at_inf, eval_at_inf]);
+        let eval_at_1 =  sum_check_claim - eval_at_0;
+        
+        let eval_at_inf:BinaryField128b = (0..half_size).into_par_iter().map(|i| (repacked_mle.idx(i << 1) + repacked_mle.idx((i << 1)| 1)) * (tensored_eq.idx(i<<1) + tensored_eq.idx((i<<1)|1))).sum();
+
+        
+        let poly = Univariate::new(vec![eval_at_0, eval_at_0 + eval_at_1 + eval_at_inf, eval_at_inf]);
 
         channel
             .observe_field_elems(&poly.coeffs)
@@ -168,15 +173,11 @@ pub fn prove<F>(
         sum_check_oracles.push(poly);
         repacked_mle = repacked_mle.fold_lo(&r);
         tensored_eq.fold_lo(&r);
+        random_challenges.push(r);
     }
 
     //FRI
     let final_code_folded_value = fri_folded_codes[rounds - 1].idx(0);
-    let c: BinaryField128b = <BinaryField128b as ExtensionField<BinaryField1b>>
-        ::iter_bases(&final_code_folded_value)
-        .zip(batching_eq.vals)
-        .map(|(component, coeff)| component * coeff)
-        .sum();
 
     channel
         .observe_field_elem(final_code_folded_value)
@@ -276,20 +277,25 @@ impl EvalProof {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Univariate {
-    pub coeffs: [BinaryField128b; 3],
+    pub coeffs: Vec<BinaryField128b>,
 }
 
 impl Univariate {
-    pub fn new(coeffs: [BinaryField128b; 3]) -> Univariate {
+    pub fn new(coeffs: Vec<BinaryField128b>) -> Univariate {
         Univariate {
             coeffs,
         }
     }
 
     pub fn evaluate(&self, r: BinaryField128b) -> BinaryField128b {
-        self.coeffs[0] + self.coeffs[1] * r + self.coeffs[2] * r.square()
+        let mut eval = BinaryField128b::ZERO;
+
+        for val in self.coeffs.iter().rev(){
+            eval = *val + eval*r
+        }
+        eval
     }
 }
 
