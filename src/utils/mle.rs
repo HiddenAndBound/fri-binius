@@ -15,6 +15,7 @@ use rayon::{
     },
     slice::ParallelSlice,
 };
+use tracing::instrument;
 
 use crate::utils::{ mle, TAU };
 
@@ -181,6 +182,12 @@ impl LagrangeBases {
         }
     }
 
+    pub fn packed_idx(&self, idx: usize) -> BinaryField1b {
+        let out_idx = idx >> 7;
+        let in_idx = (out_idx << 7) ^ idx;
+        <BinaryField128b as ExtensionField<BinaryField1b>>::iter_bases(&self.vals[out_idx]).nth(in_idx).unwrap()
+    }
+
     pub fn from_mle(mle: PackedMLE<BinaryField128b>) -> LagrangeBases {
         let vars = mle.coeffs.len().trailing_zeros() as usize;
         LagrangeBases {
@@ -217,6 +224,20 @@ impl LagrangeBases {
 
         self.vals = fold;
         self.vars -= 1;
+    }
+
+    #[instrument(skip_all, name = "row batch eq", level = "debug")]
+    pub fn row_batch(&mut self, eq: &LagrangeBases)->LagrangeBases{
+        let vals =  (0..self.vals.len())
+                .into_par_iter()
+                .map(|i| {
+                    <BinaryField128b as ExtensionField<BinaryField1b>>::iter_bases(&self.idx(i)).zip(eq.vals.iter()).map(|(b, e)| b* *e).sum()
+                }
+                ).collect();
+                LagrangeBases{
+                    vals,
+                    vars:self.vars,
+                }
     }
 
     //Compute eq table with one variable dropped for Gruen's optimisation.

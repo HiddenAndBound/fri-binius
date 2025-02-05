@@ -8,7 +8,7 @@ use binius_field::{
     Field,
     TowerField,
 };
-use rayon::iter::{ IntoParallelIterator, ParallelIterator };
+use rayon::{iter::{ IntoParallelIterator, ParallelIterator }, slice::ParallelSlice};
 use sha3::{ Digest, Keccak256, digest::{ consts::U32, generic_array::GenericArray } };
 use tracing::instrument;
 
@@ -151,6 +151,18 @@ pub fn verify_merkle_path(
     assert_eq!(hash, commitment.root);
 }
 
+#[instrument(skip_all, name = "compute leaf hashes", level="debug")]
+pub fn compute_leaf_hashes(vals: &Vec<BinaryField128b>)->Vec<Hash>{
+    vals.par_chunks(2)
+        .map(|pair| {
+            let mut hasher = Keccak256::new();
+            hasher.update(pair[0].val().to_le_bytes());
+            hasher.update(pair[1].val().to_le_bytes());
+
+            Hash(hasher.finalize())
+        })
+        .collect()
+}
 pub mod tests {
     use rand::Rng;
 

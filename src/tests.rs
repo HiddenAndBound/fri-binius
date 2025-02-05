@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use binius_field::{ BinaryField128b, BinaryField64b, Field };
+use binius_field::{ BinaryField128b, BinaryField32b, BinaryField64b, Field };
 use binius_ntt::{ MultithreadedNTT, SingleThreadedNTT };
 use rand::thread_rng;
 use rayon::iter::{ IntoParallelIterator, ParallelIterator };
@@ -27,16 +27,14 @@ fn fri_test() {
         let poly = PackedMLE::new(poly, true);
         println!("Making ntt precomputations");
         let time = Instant::now();
-        let ntt = SingleThreadedNTT::<BinaryField128b>
+        let ntt = SingleThreadedNTT::<BinaryField32b>
             ::new(l + LOG_RATE)
             .unwrap()
             .multithreaded();
-        println!("Time: {:?} \n", time.elapsed());
-
-        println!("Committing");
+     
 
         let time = Instant::now();
-        let (commitment, encoded_poly, merkle_tree) = commit(&poly, &ntt);
+        let (commitment, encoded_poly, merkle_tree) = commit::<BinaryField64b, BinaryField32b>(&poly, &ntt);
         println!("Time: {:?} \n", time.elapsed());
 
         let point: Vec<BinaryField128b> = (0..l + 6)
@@ -52,7 +50,6 @@ fn fri_test() {
 
         println!("Generating proof");
         let time = Instant::now();
-
         let eval_proof = prove(
             &poly,
             &point,

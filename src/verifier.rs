@@ -13,14 +13,16 @@ use crate::{
 
 
 
-pub fn verify(
+pub fn verify<P>(
     commitment: &FriCommitment,
     eval_point: &[BinaryField128b],
     eval: BinaryField128b,
     eval_proof: EvalProof,
-    ntt: &MultithreadedNTT<BinaryField128b>,
+    ntt: &MultithreadedNTT<P>,
     channel: &mut Channel
 )
+where BinaryField128b:ExtensionField<P>,
+P:BinaryField
 {
     channel.observe_fri_commitment(commitment);
     channel.observe_field_elems(eval_point).expect("failed to observe eval_point");

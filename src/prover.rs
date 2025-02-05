@@ -1,47 +1,50 @@
-use std::{ cell::UnsafeCell, cmp::max, thread::{ self, available_parallelism } };
+use std::{
+    cell::UnsafeCell,
+    cmp::max,
+    thread::{self, available_parallelism},
+};
 
 use binius_field::{
-    arithmetic_traits::{Square, TaggedSquare}, BinaryField, BinaryField128b, BinaryField1b, ExtensionField, Field, PackedBinaryField128x1b, PackedField, TowerField
+    arithmetic_traits::{Square, TaggedSquare}, BinaryField, BinaryField128b, BinaryField1b, ExtensionField, Field, PackedBinaryField128x1b, PackedExtension, PackedField, RepackedExtension, TowerField
 };
-use binius_ntt::MultithreadedNTT;
+use binius_ntt::{DynamicDispatchNTT, MultithreadedNTT};
 use rand::thread_rng;
-use rayon::{ iter::{ IntoParallelIterator, ParallelIterator }, slice::ParallelSlice };
-use sha3::{ Digest, Keccak256 };
+use rayon::{
+    iter::{IntoParallelIterator, ParallelIterator},
+    slice::ParallelSlice,
+};
+use sha3::{Digest, Keccak256};
 use tracing::instrument;
 
-use crate::{utils::{
-    channel::{ self, Channel },
-    code::{ Code, LOG_RATE, RATE },
-    merkle::{ merklize, Hash, MerkleTree, VectorCommitment },
-    mle::{ compute_dot_product, compute_row_batch, LagrangeBases, PackedMLE },
-    TAU,
-}, verifier::compute_eq_tower_ind};
+use crate::{
+    utils::{
+        TAU,
+        channel::{self, Channel},
+        code::{Code, LOG_RATE, RATE},
+        merkle::{Hash, MerkleTree, VectorCommitment, compute_leaf_hashes, merklize},
+        mle::{LagrangeBases, PackedMLE, compute_dot_product, compute_row_batch},
+    },
+    verifier::compute_eq_tower_ind,
+};
 
 pub struct FriCommitment {
     pub vector_commitment: VectorCommitment,
     pub packing_factor: usize,
 }
 
-pub fn commit<F>(
+#[instrument(skip_all, name = "commit", level = "debug")]
+pub fn commit<F, P>(
     mle: &PackedMLE<F>,
-    ntt: &MultithreadedNTT<BinaryField128b>
-)
-    -> (FriCommitment, Code<BinaryField128b>, MerkleTree)
-    where F: BinaryField + TowerField, BinaryField128b: ExtensionField<F>
+    ntt: &MultithreadedNTT<P>,
+) -> (FriCommitment, Code<BinaryField128b>, MerkleTree)
+where
+    BinaryField128b: ExtensionField<F> + ExtensionField<P> + PackedExtension<P>,
+    F: BinaryField + TowerField + ExtensionField<P>,
+    P:BinaryField + PackedField
 {
-    let code = Code::new(&mle.coeffs, ntt);
+    let code = Code::new_ext(&mle.coeffs, ntt);
 
-    let leaf_hashes: Vec<Hash> = code.encoding
-        .par_chunks(2)
-        .map(|pair| {
-            let mut hasher = Keccak256::new();
-            hasher.update(pair[0].val().to_le_bytes());
-            hasher.update(pair[1].val().to_le_bytes());
-
-            Hash(hasher.finalize())
-        })
-        .collect();
-
+    let leaf_hashes: Vec<Hash> = compute_leaf_hashes(&code.encoding);
     let merkle_tree = merklize(leaf_hashes);
 
     let vector_commitment = VectorCommitment {
@@ -51,24 +54,15 @@ pub fn commit<F>(
 
     let fri_commitment = FriCommitment {
         vector_commitment,
-        packing_factor: F::LOG_DEGREE,
+        packing_factor: <F as TowerField>::TOWER_LEVEL,
     };
 
     (fri_commitment, code, merkle_tree)
 }
 
+#[instrument(skip_all, name = "commit_fri_oracle", level = "debug")]
 pub fn commit_oracle(code: &Code<BinaryField128b>) -> (VectorCommitment, MerkleTree) {
-    let leaf_hashes: Vec<Hash> = code.encoding
-        .par_chunks(2)
-        .map(|pair| {
-            let mut hasher = Keccak256::new();
-            hasher.update(BinaryField128b::from(pair[0]).val().to_le_bytes());
-            hasher.update(BinaryField128b::from(pair[1]).val().to_le_bytes());
-
-            Hash(hasher.finalize())
-        })
-        .collect();
-
+    let leaf_hashes: Vec<Hash> = compute_leaf_hashes(&code.encoding);
     let merkle_tree = merklize(leaf_hashes);
 
     let vector_commitment = VectorCommitment {
@@ -81,23 +75,31 @@ pub fn commit_oracle(code: &Code<BinaryField128b>) -> (VectorCommitment, MerkleT
 
 ///We assume that each coefficient of mle actually represents a packed vector of F_2 elements equal to number of bits required to represent F or
 ///F's dimension as a vector space over F_2
-pub fn prove<F>(
+
+#[instrument(skip_all, name = "prove", level = "debug")]
+pub fn prove<F,P>(
     mle: &PackedMLE<F>,
     eval_point: &[BinaryField128b],
     eval: BinaryField128b,
     encoding: &Code<BinaryField128b>,
     commitment: &FriCommitment,
     merkle_tree: &MerkleTree,
-    ntt: &MultithreadedNTT<BinaryField128b>,
-    channel: &mut Channel
-)
-    -> EvalProof
-    where F: BinaryField + TowerField, BinaryField128b: ExtensionField<F>
+    ntt: &MultithreadedNTT<P>,
+    channel: &mut Channel,
+) -> EvalProof
+where
+    BinaryField128b: ExtensionField<F> + ExtensionField<P> + PackedExtension<P>,
+    F: BinaryField + TowerField,
+    P:BinaryField
 {
     //The statement should be observed
     channel.observe_fri_commitment(commitment);
-    channel.observe_field_elems(eval_point).expect("failed to observe eval_point");
-    channel.observe_field_elem(eval).expect("failed to observe eval");
+    channel
+        .observe_field_elems(eval_point)
+        .expect("failed to observe eval_point");
+    channel
+        .observe_field_elem(eval)
+        .expect("failed to observe eval");
 
     let (left, right) = eval_point.split_at(TAU);
 
@@ -117,10 +119,8 @@ pub fn prove<F>(
     let mut repacked_mle = mle.clone().repack_for_fri();
 
     let mut sum_check_claim = compute_row_batch(&batching_eq.vals, &upper_partial_evals);
-    
-    let right_eq_mle = PackedMLE::<BinaryField128b>::new(right_eq.vals, true);    
-    
-    let mut tensored_eq = LagrangeBases::from_mle(right_eq_mle.fold_as_unpacked_lo(&batching_eq));
+
+    let mut tensored_eq = right_eq.row_batch(&batching_eq);
 
     let rounds = right.len();
 
@@ -130,30 +130,18 @@ pub fn prove<F>(
     let mut fri_oracles: Vec<VectorCommitment> = Vec::new();
     let mut fri_merkle_trees: Vec<MerkleTree> = Vec::new();
 
-    let eval:BinaryField128b = (0..1<<right.len()).into_par_iter().map(|i| (repacked_mle.idx(i) * tensored_eq.idx(i))).sum();
-
-    println!("{:?}",eval);
     let mut random_challenges = Vec::new();
     for round in 0..rounds {
         //Sum check Logic
-        let half_size = 1 << (rounds - round - 1);
+        let poly = sum_check_round(&repacked_mle, &tensored_eq, sum_check_claim);
 
-        let eval_at_0 = (0..half_size).into_par_iter().map(|i| (repacked_mle.idx(i << 1) * tensored_eq.idx(i<<1))).sum();
-        
-        let eval_at_1 =  sum_check_claim - eval_at_0;
-        
-        let eval_at_inf:BinaryField128b = (0..half_size).into_par_iter().map(|i| (repacked_mle.idx(i << 1) + repacked_mle.idx((i << 1)| 1)) * (tensored_eq.idx(i<<1) + tensored_eq.idx((i<<1)|1))).sum();
+        channel.observe_field_elems(&poly.coeffs).expect(&format!(
+            "failed to observe prover oracle in sum check: round {round}"
+        ));
 
-        
-        let poly = Univariate::new(vec![eval_at_0, eval_at_0 + eval_at_1 + eval_at_inf, eval_at_inf]);
-
-        channel
-            .observe_field_elems(&poly.coeffs)
-            .expect(&format!("failed to observe prover oracle in sum check: round {round}"));
-
-        let r = channel
-            .get_random_point()
-            .expect(&format!("failed to get verifier challenge in sumcheck: round {round}"));
+        let r = channel.get_random_point().expect(&format!(
+            "failed to get verifier challenge in sumcheck: round {round}"
+        ));
 
         sum_check_claim = poly.evaluate(r);
 
@@ -194,41 +182,31 @@ pub fn prove<F>(
     let mut round_queried_symbols: Vec<Vec<(BinaryField128b, BinaryField128b)>> = Vec::new();
     for round in 0..rounds {
         let (merkle_paths, queried_symbols) = match round {
-            0 => {
-                (
-                    current_queries
-                        .iter()
-                        .map(|i| { merkle_tree.get_merkle_path(*i) })
-                        .collect(),
-                    current_queries
-                        .iter()
-                        .map(|i| {
-                            (
-                                encoding.encoding[i << 1],
-                                encoding.encoding[(i << 1) | 1],
-                            )
-                        })
-                        .collect(),
-                )
-            }
-            _ => {
-                (
-                    current_queries
-                        .iter()
-                        .map(|i| { fri_merkle_trees[round - 1].get_merkle_path(*i) })
-                        .collect(),
-
-                    current_queries
-                        .iter()
-                        .map(|i| {
-                            (
-                                fri_folded_codes[round - 1].encoding[i << 1],
-                                fri_folded_codes[round - 1].encoding[(i << 1) | 1],
-                            )
-                        })
-                        .collect(),
-                )
-            }
+            0 => (
+                current_queries
+                    .iter()
+                    .map(|i| merkle_tree.get_merkle_path(*i))
+                    .collect(),
+                current_queries
+                    .iter()
+                    .map(|i| (encoding.encoding[i << 1], encoding.encoding[(i << 1) | 1]))
+                    .collect(),
+            ),
+            _ => (
+                current_queries
+                    .iter()
+                    .map(|i| fri_merkle_trees[round - 1].get_merkle_path(*i))
+                    .collect(),
+                current_queries
+                    .iter()
+                    .map(|i| {
+                        (
+                            fri_folded_codes[round - 1].encoding[i << 1],
+                            fri_folded_codes[round - 1].encoding[(i << 1) | 1],
+                        )
+                    })
+                    .collect(),
+            ),
         };
         round_merkle_paths.push(merkle_paths);
         round_queried_symbols.push(queried_symbols);
@@ -244,7 +222,7 @@ pub fn prove<F>(
         fri_oracles,
         final_code_folded_value,
         round_queried_symbols,
-        round_merkle_paths
+        round_merkle_paths,
     )
 }
 
@@ -264,7 +242,7 @@ impl EvalProof {
         fri_oracles: Vec<VectorCommitment>,
         final_folded_value: BinaryField128b,
         fri_queried_symbols: Vec<Vec<(BinaryField128b, BinaryField128b)>>,
-        fri_merkle_paths: Vec<Vec<Vec<Hash>>>
+        fri_merkle_paths: Vec<Vec<Vec<Hash>>>,
     ) -> EvalProof {
         EvalProof {
             upper_partial_evals,
@@ -284,36 +262,63 @@ pub struct Univariate {
 
 impl Univariate {
     pub fn new(coeffs: Vec<BinaryField128b>) -> Univariate {
-        Univariate {
-            coeffs,
-        }
+        Univariate { coeffs }
     }
 
     pub fn evaluate(&self, r: BinaryField128b) -> BinaryField128b {
         let mut eval = BinaryField128b::ZERO;
 
-        for val in self.coeffs.iter().rev(){
-            eval = *val + eval*r
+        for val in self.coeffs.iter().rev() {
+            eval = *val + eval * r
         }
         eval
     }
 }
 
-pub fn get_partial_evals<F>(
-    mle: &PackedMLE<F>,
-    eq: &LagrangeBases
-)->Vec<BinaryField128b>
-where 
-F:BinaryField+TowerField,
-BinaryField128b:ExtensionField<F>
+#[instrument(skip_all, name = "get partial evals", level = "debug")]
+pub fn get_partial_evals<F>(mle: &PackedMLE<F>, eq: &LagrangeBases) -> Vec<BinaryField128b>
+where
+    F: BinaryField + TowerField,
+    BinaryField128b: ExtensionField<F>,
 {
-    (0..1 << TAU).into_par_iter().map(|k| {
-        let vars = mle.variables;
+    (0..1 << TAU)
+        .into_par_iter()
+        .map(|k| {
+            let vars = mle.variables;
 
-        let res:BinaryField128b = (0..1<<(vars-TAU)).into_iter().map(move |j|
-            mle.packed_idx(k.clone() | (j<<TAU))*eq.idx(j)
-        ).sum();
+            let res: BinaryField128b = (0..1 << (vars - TAU))
+                .into_iter()
+                .map(move |j| mle.packed_idx(k.clone() | (j << TAU)) * eq.idx(j))
+                .sum();
 
-        res
-    }).collect()
+            res
+        })
+        .collect()
+}
+
+#[instrument(skip_all, name = "sum check", level = "debug")]
+pub fn sum_check_round(mle:&PackedMLE<BinaryField128b>, eq:&LagrangeBases, sum_check_claim:BinaryField128b)->Univariate{
+
+    let half_size = mle.len()/2;
+
+    let eval_at_0 = (0..half_size)
+        .into_par_iter()
+        .map(|i| (mle.idx(i << 1) * eq.idx(i << 1)))
+        .sum();
+
+    let eval_at_1 = sum_check_claim - eval_at_0;
+
+    let eval_at_inf: BinaryField128b = (0..half_size)
+        .into_par_iter()
+        .map(|i| {
+            (mle.idx(i << 1) + mle.idx((i << 1) | 1))
+                * (eq.idx(i << 1) + eq.idx((i << 1) | 1))
+        })
+        .sum();
+
+    Univariate::new(vec![
+        eval_at_0,
+        eval_at_0 + eval_at_1 + eval_at_inf,
+        eval_at_inf,
+    ])
 }
