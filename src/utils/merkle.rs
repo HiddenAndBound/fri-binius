@@ -1,28 +1,23 @@
-use std::collections::HashMap;
-
-use binius_field::{
-    BinaryField,
-    BinaryField64b,
-    BinaryField128b,
-    ExtensionField,
-    Field,
-    TowerField,
+use anyhow::ensure;
+use binius_field::{BinaryField128b, ExtensionField, Field};
+use rayon::{iter::ParallelIterator, slice::ParallelSlice};
+use sha3::{
+    Digest, Keccak256,
+    digest::{consts::U32, generic_array::GenericArray},
 };
-use rayon::{iter::{ IntoParallelIterator, ParallelIterator }, slice::ParallelSlice};
-use sha3::{ Digest, Keccak256, digest::{ consts::U32, generic_array::GenericArray } };
 use tracing::instrument;
 
-//Wrapper struct for hash digests
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Wrapper struct for Keccak-256 digests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hash(pub GenericArray<u8, U32>);
 
-//Struct for Merkle Tree. Backing type chosen to be a hashmap for average case constant insertions and indexing.
+/// Merkle tree backed by contiguous layers (index 0 = root, last = leaves).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MerkleTree {
-    pub data: HashMap<usize, Vec<Hash>>,
+    pub data: Vec<Vec<Hash>>,
 }
 
-//Struct for Merkle Tree. Backing type chosen to be a hashmap for average case constant insertions and indexing.
+/// Commitment that stores the Merkle root and the number of hashing rounds (tree depth).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VectorCommitment {
     pub root: Hash,
@@ -44,22 +39,30 @@ impl MerkleTree {
     }
 
     pub fn get_root(&self) -> Hash {
-        self.data.get(&0).unwrap()[0].clone()
+        self.data[0][0]
     }
 }
 
+/// Hash arbitrary bytes using Keccak-256.
 #[inline(always)]
 pub fn hash(data: &[u8]) -> Hash {
     Hash(Keccak256::digest(data))
 }
 
+/// Hash a single field element by embedding it into `BinaryField128b` first.
 //We assume that the highest level tower field is T_7, so we convert any towerfield element to T_7
-pub fn hash_field<F>(data: &F) -> Hash where BinaryField128b: ExtensionField<F>, F: Field {
-    Hash(Keccak256::digest(BinaryField128b::from(*data).val().to_le_bytes()))
+pub fn hash_field<F>(data: &F) -> Hash
+where
+    BinaryField128b: ExtensionField<F>,
+    F: Field,
+{
+    Hash(Keccak256::digest(
+        BinaryField128b::from(*data).val().to_le_bytes(),
+    ))
 }
 
-pub fn hash_tuple(data: &(BinaryField128b, BinaryField128b)) -> Hash
-{
+/// Hash a pair of field elements sequentially.
+pub fn hash_tuple(data: &(BinaryField128b, BinaryField128b)) -> Hash {
     let mut hasher = Keccak256::new();
     hasher.update(data.0.val().to_le_bytes());
     hasher.update(data.1.val().to_le_bytes());
@@ -67,7 +70,6 @@ pub fn hash_tuple(data: &(BinaryField128b, BinaryField128b)) -> Hash
 }
 #[inline(always)]
 pub fn hash_concatenation(data1: &Hash, data2: &Hash) -> Hash {
-    let hasher = Keccak256::new();
     let mut val = [0; 64];
     //faster than chain update
     for i in 0..32 {
@@ -77,83 +79,92 @@ pub fn hash_concatenation(data1: &Hash, data2: &Hash) -> Hash {
     Hash(Keccak256::digest(val))
 }
 
-#[instrument(skip_all, name = "make_merkle_tree", level = "debug")]
+/// Build every layer of a Merkle tree from a power-of-two set of leaf hashes.
+#[instrument(skip_all, name = "merklize", level = "debug")]
 pub fn merklize(leaf_hashes: Vec<Hash>) -> MerkleTree {
     assert!(
         leaf_hashes.len().is_power_of_two(),
         "Leaf hashes are not power of 2, cannot make Merkle Tree"
     );
 
-    let mut tree: HashMap<usize, Vec<Hash>> = HashMap::new();
-
     let tree_depth = leaf_hashes.len().trailing_zeros() as usize;
+    let mut layers: Vec<Vec<Hash>> = Vec::with_capacity(tree_depth + 1);
+    layers.push(leaf_hashes);
 
-    tree.insert(tree_depth, leaf_hashes);
-
-    for depth in (0..tree_depth).rev() {
-        let lower_layer = tree.get(&(depth + 1)).unwrap();
-
-        let current_layer_size = lower_layer.len() / 2;
-
-        let current_layer: Vec<Hash> = (0..current_layer_size)
-            .into_par_iter()
-            .map(|i| hash_concatenation(&lower_layer[2 * i], &lower_layer[2 * i + 1]))
-            .collect();
-
-        tree.insert(depth, current_layer);
+    for _ in 0..tree_depth {
+        let parent_layer = build_parent_layer(layers.last().unwrap());
+        layers.push(parent_layer);
     }
 
-    MerkleTree { data: tree }
+    layers.reverse();
+
+    MerkleTree { data: layers }
 }
 
-pub fn get_merkle_path(tree: &HashMap<usize, Vec<Hash>>, leaf_index: usize) -> Vec<Hash> {
-    let tree_depth = tree.len();
+/// Return the sibling hashes from a leaf up to (but excluding) the root.
+pub fn get_merkle_path(tree: &[Vec<Hash>], leaf_index: usize) -> Vec<Hash> {
+    let leaf_depth = tree
+        .len()
+        .checked_sub(1)
+        .expect("Merkle tree cannot be empty");
 
-    // println!("{:?}", tree.keys());
-    let mut indices = vec![leaf_index; tree_depth - 1];
-    let mut path = Vec::new();
-    for d in 0..tree_depth - 1 {
-        if ((leaf_index >> d) & 1) == 0 {
-            indices[d] = (leaf_index >> d) + 1;
-        } else {
-            indices[d] = (leaf_index >> d) - 1;
-        }
-    }
+    assert!(
+        leaf_index < tree[leaf_depth].len(),
+        "Leaf index out of bounds"
+    );
 
-    for i in 0..indices.len() {
-        path.push(match tree.get(&(tree_depth - i - 1)) {
-            Some(tree_layer) => tree_layer[indices[i]].clone(),
-            None => panic!("Tried to index {:?}, not found", tree_depth - i),
-        });
+    let mut index = leaf_index;
+    let mut path = Vec::with_capacity(leaf_depth);
+
+    for depth in (1..=leaf_depth).rev() {
+        let sibling = index ^ 1;
+        path.push(tree[depth][sibling]);
+        index >>= 1;
     }
 
     path
 }
 
+/// Recompute the Merkle root from a leaf hash and its path, asserting equality.
 pub fn verify_merkle_path(
     commitment: &VectorCommitment,
     leaf_hash: Hash,
     leaf_index: usize,
-    merkle_path: &Vec<Hash>
-) {
+    merkle_path: &[Hash],
+) -> anyhow::Result<()> {
     let mut hash = leaf_hash;
 
-    assert_eq!(merkle_path.len(), commitment.depth);
+    ensure!(
+        merkle_path.len() == commitment.depth,
+        "Merkle path length doesn't match claimed depth."
+    );
 
     for d in 0..merkle_path.len() {
-        if ((leaf_index >> d) & 1) == 0 {
-            hash = hash_concatenation(&hash, &merkle_path[d]);
+        let is_left_child = ((leaf_index >> d) & 1) == 0;
+        hash = if is_left_child {
+            hash_concatenation(&hash, &merkle_path[d])
         } else {
-            hash = hash_concatenation(&merkle_path[d], &hash);
-        }
+            hash_concatenation(&merkle_path[d], &hash)
+        };
     }
 
-    assert_eq!(hash, commitment.root);
+    ensure!(
+        hash == commitment.root,
+        "Path at index {leaf_index} failed to verify."
+    );
+    Ok(())
 }
 
-#[instrument(skip_all, name = "compute leaf hashes", level="debug")]
-pub fn compute_leaf_hashes(vals: &Vec<BinaryField128b>)->Vec<Hash>{
-    vals.par_chunks(2)
+/// Collapse pairs of field elements into leaf hashes.
+#[instrument(skip_all, name = "compute_leaf_hashes", level = "debug")]
+pub fn compute_leaf_hashes(vals: &[BinaryField128b]) -> Vec<Hash> {
+    assert_eq!(
+        vals.len() & 1,
+        0,
+        "Leaf construction requires an even number of field elements"
+    );
+
+    vals.par_chunks_exact(2)
         .map(|pair| {
             let mut hasher = Keccak256::new();
             hasher.update(pair[0].val().to_le_bytes());
@@ -163,7 +174,21 @@ pub fn compute_leaf_hashes(vals: &Vec<BinaryField128b>)->Vec<Hash>{
         })
         .collect()
 }
-pub mod tests {
+
+fn build_parent_layer(child_layer: &[Hash]) -> Vec<Hash> {
+    assert_eq!(
+        child_layer.len() & 1,
+        0,
+        "Child layer must contain an even number of nodes"
+    );
+    child_layer
+        .par_chunks_exact(2)
+        .map(|pair| hash_concatenation(&pair[0], &pair[1]))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
     use rand::Rng;
 
     use super::*;
@@ -180,7 +205,7 @@ pub mod tests {
             })
             .collect();
 
-        let merkle_tree = merklize(leaf_hashes);
+        let _merkle_tree = merklize(leaf_hashes);
     }
 
     #[test]
@@ -204,6 +229,6 @@ pub mod tests {
         let idx = thread_rng().gen_range(0..1 << 8);
         let merkle_path = merkle_tree.get_merkle_path(idx);
 
-        verify_merkle_path(&commitment, leaf_hashes[idx].clone(), idx, &merkle_path);
+        verify_merkle_path(&commitment, leaf_hashes[idx].clone(), idx, &merkle_path).unwrap();
     }
 }

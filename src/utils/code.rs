@@ -1,21 +1,9 @@
-use std::error;
-
-use binius_field::{
-    BinaryField, BinaryField1b, BinaryField32b, BinaryField64b, BinaryField128b, ExtensionField,
-    Field, PackedExtension, RepackedExtension, TowerField, as_packed_field::PackScalar,
-};
-use binius_ntt::{AdditiveNTT, Error, MultithreadedNTT, SingleThreadedNTT};
-use rand::thread_rng;
+use binius_field::{BinaryField, BinaryField128b, ExtensionField, PackedExtension, TowerField};
+use binius_ntt::{AdditiveNTT, MultithreadedNTT};
 use rayon::{
-    iter::{
-        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-        IntoParallelRefMutIterator, ParallelIterator,
-    },
+    iter::{IndexedParallelIterator, ParallelIterator},
     slice::ParallelSlice,
 };
-use tracing::instrument;
-
-use crate::utils::mle::LagrangeBases;
 
 pub const RATE: usize = 4;
 pub const LOG_RATE: usize = 2;
@@ -26,52 +14,65 @@ pub struct Code<F: BinaryField> {
 }
 
 impl Code<BinaryField128b> {
-    #[instrument(skip_all, name = "encode", level = "debug")]
+    fn repack_message<F>(message: &[F]) -> Vec<BinaryField128b>
+    where
+        BinaryField128b: ExtensionField<F>,
+        F: BinaryField + TowerField,
+    {
+        message
+            .par_chunks(<BinaryField128b as ExtensionField<F>>::DEGREE)
+            .map(|base_elems| {
+                BinaryField128b::from_bases(base_elems).expect("failed to repack base elements")
+            })
+            .collect()
+    }
+
+    fn encode_with_transform<F, N, T>(
+        message: &[F],
+        ntt: &MultithreadedNTT<N>,
+        mut transform: T,
+    ) -> Code<BinaryField128b>
+    where
+        BinaryField128b: ExtensionField<F>,
+        F: BinaryField + TowerField,
+        N: BinaryField,
+        T: FnMut(&MultithreadedNTT<N>, &mut Vec<BinaryField128b>, u32),
+    {
+        let repacked_message = Self::repack_message(message);
+        let mut encoding = Vec::with_capacity(repacked_message.len() * RATE);
+
+        for round in 0..RATE as u32 {
+            let mut temp = repacked_message.clone();
+            transform(ntt, &mut temp, round);
+            encoding.append(&mut temp);
+        }
+
+        Code { encoding }
+    }
+
     pub fn new<F>(message: &[F], ntt: &MultithreadedNTT<BinaryField128b>) -> Code<BinaryField128b>
     where
         BinaryField128b: ExtensionField<F>,
         F: BinaryField + TowerField,
     {
-        let repacked_message: Vec<BinaryField128b> = message
-            .par_chunks(<BinaryField128b as ExtensionField<F>>::DEGREE)
-            .map(|base_elems| BinaryField128b::from_bases(base_elems).unwrap())
-            .collect();
-        let mut encoding = Vec::with_capacity(repacked_message.len() * RATE);
-        let mut temp;
-
-        for i in 0..RATE as u32 {
-            temp = repacked_message.clone();
-            ntt.forward_transform(&mut temp, i, 0).unwrap();
-            encoding.append(&mut temp);
-        }
-        Code { encoding }
+        Self::encode_with_transform(message, ntt, |ntt, temp, round| {
+            ntt.forward_transform(temp, round, 0)
+                .expect("NTT forward transform failed")
+        })
     }
 
-    #[instrument(skip_all, name = "encode_ext", level = "debug")]
     pub fn new_ext<F, P>(message: &[F], ntt: &MultithreadedNTT<P>) -> Code<BinaryField128b>
     where
         BinaryField128b: ExtensionField<F> + ExtensionField<P> + PackedExtension<P>,
         F: BinaryField + TowerField + ExtensionField<P>,
         P: BinaryField,
     {
-        let repacked_message: Vec<BinaryField128b> = message
-            .par_chunks(<BinaryField128b as ExtensionField<F>>::DEGREE)
-            .map(|base_elems| BinaryField128b::from_bases(base_elems).unwrap())
-            .collect();
-
-        let mut encoding = Vec::with_capacity(repacked_message.len() * RATE);
-        let mut temp;
-
-        for i in 0..RATE as u32 {
-            temp = repacked_message.clone();
-            ntt.forward_transform_ext::<BinaryField128b>(&mut temp, i)
-                .unwrap();
-            encoding.append(&mut temp);
-        }
-        Code { encoding }
+        Self::encode_with_transform(message, ntt, |ntt, temp, round| {
+            ntt.forward_transform_ext::<BinaryField128b>(temp, round)
+                .expect("extended NTT forward transform failed");
+        })
     }
 
-    #[instrument(skip_all, name = "fold code", level = "debug")]
     pub fn fold_code<P>(
         &self,
         r: BinaryField128b, //folding challenge
@@ -82,18 +83,13 @@ impl Code<BinaryField128b> {
         BinaryField128b: ExtensionField<P>,
         P: BinaryField,
     {
-        let mut encoding: Vec<BinaryField128b> = vec![BinaryField128b::ZERO; self.encoding.len() >> 1];
+        let encoding: Vec<BinaryField128b> = self
+            .encoding
+            .par_chunks_exact(2)
+            .enumerate()
+            .map(|(i, pair)| fold(r, round, i, pair[0], pair[1], ntt))
+            .collect();
 
-        encoding.par_iter_mut().enumerate().for_each(|(i, val)| {
-            *val = fold(
-                r,
-                round,
-                i,
-                self.encoding[i << 1],
-                self.encoding[(i << 1) | 1],
-                ntt,
-            )
-        });
         Code { encoding }
     }
 
@@ -126,57 +122,66 @@ where
     x0 + r * (x0 + x1)
 }
 
-#[test]
-fn test_fold() {
-    let l = 11;
-    let poly: Vec<BinaryField128b> = (0..1 << l)
-        .into_par_iter()
-        .map(|_| BinaryField128b::random(thread_rng()))
-        .collect();
+#[cfg(test)]
+mod tests {
+    use crate::utils::mle::LagrangeBases;
 
-    let ntt = SingleThreadedNTT::<BinaryField128b>::new(l + 2)
-        .unwrap()
-        .multithreaded();
+    use super::*;
+    use binius_field::Field;
+    use binius_ntt::SingleThreadedNTT;
+    use rand::thread_rng;
+    use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator};
+    #[test]
+    fn test_fold() {
+        let l = 11;
+        let poly: Vec<BinaryField128b> = (0..1 << l)
+            .into_par_iter()
+            .map(|_| BinaryField128b::random(thread_rng()))
+            .collect();
 
-    let code = Code::new(&poly, &ntt);
+        let ntt = SingleThreadedNTT::<BinaryField128b>::new(l + 2)
+            .unwrap()
+            .multithreaded();
 
-    let r: Vec<BinaryField128b> = (0..l)
-        .into_iter()
-        .map(|_| BinaryField128b::random(thread_rng()))
-        .collect();
+        let code = Code::new(&poly, &ntt);
 
-    let r_eq = LagrangeBases::gen_from_point(&r);
+        let r: Vec<BinaryField128b> = (0..l)
+            .into_iter()
+            .map(|_| BinaryField128b::random(thread_rng()))
+            .collect();
 
-    let poly_eval: BinaryField128b = poly
-        .par_iter()
-        .zip(r_eq.vals)
-        .map(|(coeff, eq_val)| *coeff * eq_val)
-        .sum();
+        let r_eq = LagrangeBases::gen_from_point(&r);
 
-    let mut folded_code = code.fold_code(r[0], 0, &ntt);
-    for round in 1..l {
-        folded_code = folded_code.fold_code(r[round], round, &ntt)
+        let poly_eval: BinaryField128b = poly
+            .par_iter()
+            .zip(r_eq.vals)
+            .map(|(coeff, eq_val)| *coeff * eq_val)
+            .sum();
+
+        let mut folded_code = code.fold_code(r[0], 0, &ntt);
+        for round in 1..l {
+            folded_code = folded_code.fold_code(r[round], round, &ntt)
+        }
+        assert_eq!(poly_eval, folded_code.idx(0));
+        assert!(
+            !folded_code.encoding.is_empty(),
+            "folding produced empty code"
+        );
     }
 
-    println!("{:?}", poly_eval);
-    println!("{:?}", folded_code)
-}
+    #[test]
+    fn test_ntt() {
+        let l = 11;
+        let mut poly = (0..1 << l)
+            .into_par_iter()
+            .map(|_| BinaryField128b::random(thread_rng()))
+            .collect::<Vec<_>>();
 
-#[test]
-fn test_ntt() {
-    let l = 11;
-    let mut poly: Vec<BinaryField64b> = (0..1 << l)
-        .into_par_iter()
-        .map(|_| BinaryField64b::random(thread_rng()))
-        .collect();
+        let ntt = SingleThreadedNTT::<BinaryField128b>::new(13)
+            .unwrap()
+            .multithreaded();
 
-    let ntt = SingleThreadedNTT::<BinaryField32b>::new(13)
-        .unwrap()
-        .multithreaded();
-
-    let res = ntt.forward_transform_ext(&mut poly, 0);
-    match res {
-        Ok(()) => println!("ok"),
-        Err(error) => println!("{:?}", error),
+        ntt.forward_transform_ext(&mut poly, 0)
+            .expect("extended forward transform failed");
     }
 }

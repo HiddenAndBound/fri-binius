@@ -12,6 +12,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.100"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
+
+[[package]]
 name = "auto_impl"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -59,7 +65,7 @@ dependencies = [
  "bytemuck",
  "either",
  "getset",
- "itertools",
+ "itertools 0.13.0",
  "rand",
  "stackalloc",
  "thiserror",
@@ -73,7 +79,7 @@ source = "git+https://gitlab.com/IrreducibleOSS/binius#a3b09e3c49345e8f94dda7b9c
 dependencies = [
  "cfg-if",
  "either",
- "itertools",
+ "itertools 0.13.0",
  "rayon",
 ]
 
@@ -100,7 +106,7 @@ dependencies = [
  "bytes",
  "cfg-if",
  "generic-array",
- "itertools",
+ "itertools 0.13.0",
  "thiserror",
  "thread_local",
 ]
@@ -256,9 +262,11 @@ checksum = "60b1af1c220855b6ceac025d3f6ecdd2b7c4894bfe9cd9bda4fbb4bc7c0d4cf0"
 name = "fri-binius"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "binius_field",
  "binius_ntt",
  "binius_utils",
+ "itertools 0.14.0",
  "rand",
  "rayon",
  "sha3",
@@ -304,6 +312,15 @@ name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]

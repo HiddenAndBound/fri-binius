@@ -1,4 +1,5 @@
-mod prover;
-mod utils;
-mod verifier;
-mod tests;
+pub mod prover;
+pub mod utils;
+pub mod verifier;
+
+pub type Result<T> = anyhow::Result<T>;

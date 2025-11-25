@@ -1,32 +1,36 @@
-use binius_field::{ BinaryField, BinaryField128b, ExtensionField, Field, TowerField };
+use anyhow::{Ok, ensure};
+use binius_field::{BinaryField, BinaryField128b, ExtensionField, Field};
 use binius_ntt::MultithreadedNTT;
+use itertools::multizip;
+use tracing::instrument;
 
 use crate::{
-    prover::{ EvalProof, FriCommitment },
+    Result,
+    prover::{EvalProof, FriCommitment},
     utils::{
-        channel::{ self, Channel },
-        code::{ fold, LOG_RATE },
-        merkle::{ hash_field, hash_tuple, verify_merkle_path, VectorCommitment },
-        mle::{compute_row_batch, switch_view, LagrangeBases}, TAU,
+        TAU,
+        channel::Channel,
+        code::{LOG_RATE, fold},
+        merkle::{hash_tuple, verify_merkle_path},
+        mle::{compute_row_batch, switch_view},
     },
 };
-
-
-
+#[instrument(skip_all, name = "verify", level = "debug")]
 pub fn verify<P>(
     commitment: &FriCommitment,
     eval_point: &[BinaryField128b],
     eval: BinaryField128b,
     eval_proof: EvalProof,
     ntt: &MultithreadedNTT<P>,
-    channel: &mut Channel
-)
-where BinaryField128b:ExtensionField<P>,
-P:BinaryField
+    channel: &mut Channel,
+) -> Result<()>
+where
+    BinaryField128b: ExtensionField<P>,
+    P: BinaryField,
 {
     channel.observe_fri_commitment(commitment);
-    channel.observe_field_elems(eval_point).expect("failed to observe eval_point");
-    channel.observe_field_elem(eval).expect("failed to observe eval");
+    channel.observe_field_elems(eval_point)?;
+    channel.observe_field_elem(eval)?;
 
     let (left, right) = eval_point.split_at(TAU);
 
@@ -38,33 +42,30 @@ P:BinaryField
         derived_eval += left_eq[i] * eval_proof.upper_partial_evals[i];
     }
 
-    assert_eq!(derived_eval, eval);
+    ensure!(derived_eval == eval);
 
-    let tensor_batching_point = channel
-        .get_random_points(TAU)
-        .expect("unable to sample random point for tensor batching");
+    let tensor_batching_point = channel.get_random_points(TAU)?;
 
     let batching_eq = compute_eq_table(&tensor_batching_point);
     let mut sum_check_claim = compute_row_batch(&batching_eq, &eval_proof.upper_partial_evals);
-    
 
     let rounds = right.len();
 
-    assert_eq!(rounds, eval_proof.sum_check_oracles.len());
+    ensure!(rounds == eval_proof.sum_check_oracles.len());
 
     let mut random_point = Vec::new();
     for round in 0..rounds {
         let oracle = &eval_proof.sum_check_oracles[round];
 
-        assert_eq!(
-             oracle.evaluate(BinaryField128b::ZERO) + oracle.evaluate(BinaryField128b::ONE),
-            sum_check_claim,
+        ensure!(
+            oracle.evaluate(BinaryField128b::ZERO) + oracle.evaluate(BinaryField128b::ONE)
+                == sum_check_claim,
             "Sum of oracle evaluations failed on round {round}"
         );
 
-        channel.observe_field_elems(&oracle.coeffs).unwrap();
+        channel.observe_field_elems(&oracle.coeffs)?;
 
-        let r = channel.get_random_point().unwrap();
+        let r = channel.get_random_point()?;
 
         let current_oracle = &eval_proof.fri_oracles[round];
         channel.observe_vector_commitment(current_oracle);
@@ -72,96 +73,64 @@ P:BinaryField
         random_point.push(r);
     }
 
-    channel
-        .observe_field_elem(eval_proof.final_folded_value)
-        .expect("Failed to observe final sum check claim");
+    channel.observe_field_elem(eval_proof.final_folded_value)?;
 
     let mut current_queries: Vec<usize> = channel
-        .gen_queries(right.len() + LOG_RATE)
-        .expect("Failed to generate FRI queries.")
+        .gen_queries(right.len() + LOG_RATE)?
         .iter()
         .map(|i| i >> 1)
         .collect();
 
+    // src/verifier.rs
     let mut folded_symbols = Vec::new();
+
     for round in 0..rounds {
-        let round_folded_symbols = match round {
-            0 => {
-                (0..current_queries.len())
-                    .into_iter()
-                    .map(|i| {
-                        let queried_symbols = eval_proof.fri_queried_symbols[round][i];
-                        let merkle_path = &eval_proof.fri_merkle_paths[round][i];
-
-                        let hash = hash_tuple(&queried_symbols);
-                        verify_merkle_path(
-                            &commitment.vector_commitment,
-                            hash,
-                            current_queries[i],
-                            &merkle_path
-                        );
-                        fold(
-                            random_point[round],
-                            round,
-                            current_queries[i],
-                            queried_symbols.0,
-                            queried_symbols.1,
-                            ntt
-                        )
-                    })
-                    .collect()
-            }
-            _ => {
-                (0..current_queries.len())
-                    .into_iter()
-                    .map(|i| {
-                        let queried_symbols = eval_proof.fri_queried_symbols[round][i];
-                        let merkle_path = &eval_proof.fri_merkle_paths[round][i];
-                        let hash = hash_tuple(&queried_symbols);
-                    
-                        if current_queries[i] & 1 == 1 {
-                            assert_eq!(
-                                folded_symbols[i], queried_symbols.1,
-                                "Symbol not consistent at query {i} in round {round}"
-                            );
-                        } else {
-                            assert_eq!(
-                                folded_symbols[i], queried_symbols.0,
-                                "Symbol not consistent at query {i} in round {round}"
-                            );
-                        }
-
-                        current_queries[i] >>= 1;
-
-                        verify_merkle_path(
-                            &eval_proof.fri_oracles[round - 1],
-                            hash,
-                            current_queries[i],
-                            &merkle_path
-                        );
-
-                        fold(
-                            random_point[round],
-                            round,
-                            current_queries[i],
-                            queried_symbols.0,
-                            queried_symbols.1,
-                            ntt
-                        )
-                        
-                        
-
-                    })
-                    .collect()
-            }
+        // Choose the commitment: root for round 0, previous oracle thereafter.
+        let oracle = match round {
+            0 => &commitment.vector_commitment,
+            _ => &eval_proof.fri_oracles[round - 1],
         };
 
-       
-        folded_symbols = round_folded_symbols
+        folded_symbols = multizip((
+            current_queries.iter_mut(),             // queries we mutate in-place
+            &eval_proof.fri_queried_symbols[round], // (s0, s1) pairs
+            &eval_proof.fri_merkle_paths[round],    // Merkle paths
+        ))
+        .enumerate()
+        .map(|(i, (query, &(s0, s1), merkle_path))| {
+            let hash = hash_tuple(&(s0, s1));
+
+            match round {
+                // First round: no consistency check yet.
+                0 => (),
+                // Later rounds: check consistency, then step up the tree.
+                _ => {
+                    let expected = match *query & 1 {
+                        1 => s1,
+                        _ => s0,
+                    };
+                    ensure!(
+                        folded_symbols[i] == expected,
+                        "Symbol not consistent at query {i} in round {round}"
+                    );
+                    *query >>= 1; // move to parent index for next round
+                }
+            }
+
+            // Membership proof against the chosen oracle
+            verify_merkle_path(oracle, hash, *query, merkle_path)?;
+
+            // Fold this pair for use in the next round
+            Ok(fold(random_point[round], round, *query, s0, s1, ntt))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     }
-    for symbol in folded_symbols{
+
+    for symbol in folded_symbols {
         assert_eq!(symbol, eval_proof.final_folded_value)
     }
+
+    Ok(())
 }
 
 pub fn compute_eq_table(r: &[BinaryField128b]) -> Vec<BinaryField128b> {
@@ -182,23 +151,27 @@ pub fn compute_eq_table(r: &[BinaryField128b]) -> Vec<BinaryField128b> {
     eq
 }
 
-pub fn compute_eq_tower_ind(r_init: &[BinaryField128b], r_sum:&[BinaryField128b], eq_batch:&[BinaryField128b])->BinaryField128b{
+pub fn compute_eq_tower_ind(
+    r_init: &[BinaryField128b],
+    r_sum: &[BinaryField128b],
+    eq_batch: &[BinaryField128b],
+) -> BinaryField128b {
     assert_eq!(r_init.len(), r_sum.len());
 
     let mut eval = vec![BinaryField128b::ZERO; 128];
 
     eval[0] = BinaryField128b::ONE;
 
-    for i in 0..r_init.len(){
-        for k in 0..128{
-            let temp = eval[i]*r_init[i];
+    for i in 0..r_init.len() {
+        for _ in 0..128 {
+            let temp = eval[i] * r_init[i];
             eval[i] += temp
         }
-        
+
         eval = switch_view(&eval);
 
-        for k in 0..128{
-            let temp = eval[i]*r_sum[i];
+        for _ in 0..128 {
+            let temp = eval[i] * r_sum[i];
             eval[i] += temp
         }
 

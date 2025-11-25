@@ -10,5 +10,7 @@ binius_utils = {git = "https://gitlab.com/IrreducibleOSS/binius" }
 rand = { version = "0.8.5"}
 rayon = "1.10.0"
 sha3 = "0.10.8"
-tracing = "0.1.38"
-tracing-profile = "0.9.1"
+tracing = "*"
+tracing-profile = "*"
+anyhow = "1.0"
+itertools = "0.14.0"
