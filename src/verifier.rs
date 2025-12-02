@@ -81,7 +81,7 @@ where
         .map(|i| i >> 1)
         .collect();
 
-    // src/verifier.rs
+    
     let mut folded_symbols = Vec::new();
 
     for round in 0..rounds {

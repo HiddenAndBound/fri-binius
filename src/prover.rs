@@ -125,13 +125,27 @@ where
     ))
 }
 
+/// Ordered pair of sibling code symbols opened at a query index.
+pub type FriSymbolPair = (BinaryField128b, BinaryField128b);
+/// All queried symbol pairs within a single FRI round.
+pub type FriRoundSymbols = Vec<FriSymbolPair>;
+/// Round-by-round list of every queried symbol pair sent in the proof.
+pub type FriQueriedSymbols = Vec<FriRoundSymbols>;
+
+/// Merkle authentication path proving a single symbol pair.
+pub type FriMerklePath = Vec<Hash>;
+/// All Merkle paths corresponding to the queries of one round.
+pub type FriRoundMerklePaths = Vec<FriMerklePath>;
+/// Round-by-round Merkle proofs accompanying the queried symbols.
+pub type FriMerkleProofs = Vec<FriRoundMerklePaths>;
+
 pub struct EvalProof {
     pub upper_partial_evals: Vec<BinaryField128b>,
     pub sum_check_oracles: Vec<Univariate>,
     pub final_folded_value: BinaryField128b,
     pub fri_oracles: Vec<VectorCommitment>,
-    pub fri_queried_symbols: Vec<Vec<(BinaryField128b, BinaryField128b)>>,
-    pub fri_merkle_paths: Vec<Vec<Vec<Hash>>>,
+    pub fri_queried_symbols: FriQueriedSymbols,
+    pub fri_merkle_paths: FriMerkleProofs,
 }
 
 impl EvalProof {
@@ -139,8 +153,8 @@ impl EvalProof {
         upper_partial_evals: Vec<BinaryField128b>,
         proof_state: ProofState,
         final_folded_value: BinaryField128b,
-        fri_queried_symbols: Vec<Vec<(BinaryField128b, BinaryField128b)>>,
-        fri_merkle_paths: Vec<Vec<Vec<Hash>>>,
+        fri_queried_symbols: FriQueriedSymbols,
+        fri_merkle_paths: FriMerkleProofs,
     ) -> EvalProof {
         EvalProof {
             upper_partial_evals,
@@ -232,19 +246,15 @@ fn query_phase(
     merkle_tree: &MerkleTree,
     channel: &mut Channel,
     proof_state: &ProofState,
-) -> Result<(
-    Vec<Vec<(BinaryField128b, BinaryField128b)>>,
-    Vec<Vec<Vec<Hash>>>,
-)> {
+) -> Result<(FriQueriedSymbols, FriMerkleProofs)> {
     let mut current_queries: Vec<usize> = channel
         .gen_queries(rounds + LOG_RATE)?
         .iter()
         .map(|i| i >> 1)
         .collect();
 
-    let mut round_merkle_paths: Vec<Vec<Vec<Hash>>> = Vec::with_capacity(rounds);
-    let mut round_queried_symbols: Vec<Vec<(BinaryField128b, BinaryField128b)>> =
-        Vec::with_capacity(rounds);
+    let mut round_merkle_paths: FriMerkleProofs = Vec::with_capacity(rounds);
+    let mut round_queried_symbols: FriQueriedSymbols = Vec::with_capacity(rounds);
 
     for round in 0..rounds {
         let (tree, code) = match round {
@@ -272,7 +282,7 @@ fn gather_round_queries(
     tree: &MerkleTree,
     code: &Code<BinaryField128b>,
     queries: &[usize],
-) -> (Vec<Vec<Hash>>, Vec<(BinaryField128b, BinaryField128b)>) {
+) -> (FriRoundMerklePaths, FriRoundSymbols) {
     let merkle_paths = queries.iter().map(|i| tree.get_merkle_path(*i)).collect();
 
     let queried_symbols = queries
